@@ -37,18 +37,183 @@
 #include <rte_tcp.h>
 #include <rte_udp.h>
 
+/* ------------------------------------------------------------------ */
+/* General config                                                       */
+/* ------------------------------------------------------------------ */
+
+#define MAX_PKT_BURST       32
+#define BURST_TX_DRAIN_US   100     /* flush TX buffer every 100 us */
+#define MEMPOOL_CACHE_SIZE  256
+#define RX_DESC_DEFAULT     1024
+#define TX_DESC_DEFAULT     1024
+#define NB_PORTS            2
+#define STATS_INTERVAL_SEC  1       /* print stats every second */
+
+/* ------------------------------------------------------------------ */
+/* Profile Queue config                                                 */
+/* ------------------------------------------------------------------ */
+
+#define NUM_PQ              10
+#define PACKETS_PER_GROUP   10      /* drop/dup ratios are out of this */
+#define DELAY_QUEUE_SIZE    2048    /* max packets waiting in one PQ delay ring */
+
+/* IP protocol numbers */
+#define PROTO_ICMP  1
+#define PROTO_TCP   6
+#define PROTO_UDP   17
+
+/* IP network prefixes (host byte order) */
+#define NET_10_0_0      0x0A000000   /* 10.0.0.0  */
+#define NET_192_168_0   0xC0A80000   /* 192.168.0.0 */
+
+/* Check if an IP (host order, 32bit) falls inside a /24 network.
+ * Shift right 8 throws away the last octet, then compare the rest. */
+#define IP_IN_SLASH24(ip, net24)   (((ip) >> 8) == ((net24) >> 8))
+
+/* small packet threshold for PQ 8 */
+#define SMALL_PKT_BYTES  128
+
+/* ------------------------------------------------------------------ */
+/* Packet header access helpers                                         */
+/* ------------------------------------------------------------------ */
+
+/* pointer to ethernet header at start of packet data */
+#define PKT_ETH(m)   rte_pktmbuf_mtod((m), struct rte_ether_hdr *)
+
+/* pointer to IPv4 header — sits right after the ethernet header */
+#define PKT_IP(m)    ((struct rte_ipv4_hdr *)(PKT_ETH(m) + 1))
+
+/* IP header length in bytes (lower nibble of version_ihl field * 4) */
+#define IP_HDR_LEN(ip)   (((ip)->version_ihl & 0x0f) << 2)
+
+/* TCP header length in bytes (upper nibble of data_off field * 4) */
+#define TCP_HDR_LEN(tcp) (((tcp)->data_off >> 4) << 2)
+
+/* pointer to TCP/UDP payload — past L4 header */
+#define TCP_PAYLOAD(l4)  ((uint8_t *)(l4) + TCP_HDR_LEN((struct rte_tcp_hdr *)(l4)))
+#define UDP_PAYLOAD(l4)  ((uint8_t *)(l4) + sizeof(struct rte_udp_hdr))
+
+/* available payload bytes given total L4 segment length and L4 header size */
+#define TCP_PAYLOAD_LEN(l4, l4_len) \
+    ((l4_len) > TCP_HDR_LEN((struct rte_tcp_hdr *)(l4)) \
+        ? (l4_len) - TCP_HDR_LEN((struct rte_tcp_hdr *)(l4)) : 0)
+#define UDP_PAYLOAD_LEN(l4_len) \
+    ((l4_len) > sizeof(struct rte_udp_hdr) \
+        ? (l4_len) - (uint32_t)sizeof(struct rte_udp_hdr) : 0)
+
+/* true if total IP packet is shorter than SMALL_PKT_BYTES */
+#define IS_SMALL_PKT(ip) \
+    (rte_be_to_cpu_16((ip)->total_length) < SMALL_PKT_BYTES)
+
+/* ------------------------------------------------------------------ */
+/* Payload pattern matching macros                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Generic: check that `buf` starts with a literal byte string of length `n`.
+ * We compare byte by byte so the compiler can inline and unroll it.
+ */
+#define PAYLOAD_STARTS_WITH(buf, buflen, pat, n) \
+    ((buflen) >= (n) && memcmp((buf), (pat), (n)) == 0)
+
+/*
+ * PQ 1 — HTTP
+ * HTTP requests start with a method verb; responses start with "HTTP/".
+ * We check the most common ones. memcmp on short fixed strings gets
+ * compiled to a handful of integer comparisons by any modern compiler.
+ */
+#define IS_HTTP(buf, len) (                             \
+    PAYLOAD_STARTS_WITH(buf, len, "GET ",     4) ||    \
+    PAYLOAD_STARTS_WITH(buf, len, "POST ",    5) ||    \
+    PAYLOAD_STARTS_WITH(buf, len, "HTTP/",    5) ||    \
+    PAYLOAD_STARTS_WITH(buf, len, "HEAD ",    5) ||    \
+    PAYLOAD_STARTS_WITH(buf, len, "PUT ",     4) ||    \
+    PAYLOAD_STARTS_WITH(buf, len, "DELETE ",  7) ||    \
+    PAYLOAD_STARTS_WITH(buf, len, "OPTIONS ", 8) )
+
+/*
+ * PQ 2 — TLS (HTTPS and others over TLS)
+ * TLS records always start with:
+ *   byte 0: content type  (0x14=ChangeCipherSpec, 0x15=Alert,
+ *                          0x16=Handshake, 0x17=ApplicationData)
+ *   byte 1: major version (0x03 for SSL3/TLS1.x)
+ *   byte 2: minor version (0x00-0x04)
+ */
+#define IS_TLS(buf, len) (                      \
+    (len) >= 3                               && \
+    (buf)[0] >= 0x14 && (buf)[0] <= 0x17    && \
+    (buf)[1] == 0x03                         && \
+    (buf)[2] <= 0x04 )
+
+/*
+ * PQ 3 — SSH
+ * The SSH protocol identification string is always "SSH-" followed by
+ * the version. Both client and server send this as the very first bytes.
+ */
+#define IS_SSH(buf, len) \
+    PAYLOAD_STARTS_WITH(buf, len, "SSH-", 4)
+
+/*
+ * PQ 4 — DNS
+ * DNS messages have a 12-byte fixed header. Bytes 2-3 are the FLAGS field:
+ *   bit 15    : QR    (0=query, 1=response)
+ *   bits 14-11: OPCODE (0=standard query, 1=inverse, 2=status)
+ *   bits 10-0 : various flags
+ * We match on OPCODE == 0 (standard query or response) which covers ~99%
+ * of real DNS traffic.
+ */
+#define DNS_OPCODE(buf)  (((buf)[2] >> 3) & 0x0f)
+#define IS_DNS(buf, len) \
+    ((len) >= 12 && DNS_OPCODE(buf) == 0)
+
+/*
+ * PQ 5 — NTP
+ * NTP packets are 48 bytes minimum. The first byte encodes:
+ *   bits 7-6: LI  (leap indicator, 0-3)
+ *   bits 5-3: VN  (version, 3 or 4 for modern NTP)
+ *   bits 2-0: Mode (1=sym active, 2=sym passive, 3=client, 4=server, 5=broadcast)
+ */
+#define NTP_VERSION(b)   (((b) >> 3) & 0x07)
+#define NTP_MODE(b)      ((b) & 0x07)
+#define IS_NTP(buf, len) (                          \
+    (len) >= 48                                  && \
+    NTP_VERSION((buf)[0]) >= 3                   && \
+    NTP_VERSION((buf)[0]) <= 4                   && \
+    NTP_MODE((buf)[0])    >= 1                   && \
+    NTP_MODE((buf)[0])    <= 5 )
+
+/* ------------------------------------------------------------------ */
+/* Drop / Duplicate logic helpers                                       */
+/* ------------------------------------------------------------------ */
+
+/* should we drop the N-th packet given we drop `drop_n` per group? */
+#define SHOULD_DROP(count, drop_n) \
+    ((drop_n) > 0 && ((count) % PACKETS_PER_GROUP) < (drop_n))
+
+/* should we duplicate the N-th packet given we dup `dup_n` per group? */
+#define SHOULD_DUP(count, dup_n) \
+    ((dup_n) > 0 && ((count) % PACKETS_PER_GROUP) < (dup_n))
+
+/* ------------------------------------------------------------------ */
+/* Delay ring helpers                                                   */
+/* ------------------------------------------------------------------ */
+
+/* advance a ring index by 1, wrapping at the ring size */
+#define RING_NEXT(idx, size)  (((idx) + 1) % (size))
+
+/* how many TSC ticks fit in one microsecond */
+#define TSC_PER_US(hz)   ((hz) / 1000000ULL)
+
+/* release timestamp for a packet that should be delayed by `us` microseconds */
+#define RELEASE_TSC(now, us, tsc_per_us)  ((now) + (uint64_t)(us) * (tsc_per_us))
+
+/* ------------------------------------------------------------------ */
+/* Data structures                                                      */
+/* ------------------------------------------------------------------ */
+
 static volatile bool force_quit;
 
 #define RTE_LOGTYPE_NETEM RTE_LOGTYPE_USER1
-
-#define MAX_PKT_BURST     32
-#define BURST_TX_DRAIN_US 100
-#define MEMPOOL_CACHE_SIZE 256
-#define RX_DESC_DEFAULT   1024
-#define TX_DESC_DEFAULT   1024
-#define NB_PORTS          2
-#define NUM_PQ            10
-#define DELAY_QUEUE_SIZE  2048  /* per PQ, per lcore */
 
 static uint16_t nb_rxd = RX_DESC_DEFAULT;
 static uint16_t nb_txd = TX_DESC_DEFAULT;
@@ -62,6 +227,7 @@ static struct rte_eth_conf port_conf = {
 
 struct rte_mempool *netem_pktmbuf_pool = NULL;
 
+/* per-port counters shown in the stats printout */
 struct __rte_cache_aligned netem_port_statistics {
 	uint64_t tx;
 	uint64_t rx;
@@ -71,25 +237,13 @@ struct __rte_cache_aligned netem_port_statistics {
 };
 struct netem_port_statistics port_statistics[NB_PORTS];
 
-static uint64_t timer_period = 1;
+static uint64_t timer_period = STATS_INTERVAL_SEC;
 
 /*
- * Profile Queue (PQ) configuration.
- * drop_n: drop this many out of every 10 packets (0 = no drop).
- * dup_n:  send an extra copy for this many out of every 10 packets.
- * delay_us: hold each packet for this many microseconds before forwarding.
- *
- * Classification (first match wins):
- *  PQ 0 – ICMP
- *  PQ 1 – TCP dst 80   (HTTP)
- *  PQ 2 – TCP dst 443  (HTTPS)
- *  PQ 3 – TCP dst 22   (SSH)
- *  PQ 4 – UDP dst 53   (DNS)
- *  PQ 5 – UDP dst 123  (NTP)
- *  PQ 6 – src IP in 10.0.0.0/24
- *  PQ 7 – src IP in 192.168.0.0/24
- *  PQ 8 – TCP dst port < 1024 (other well-known)
- *  PQ 9 – everything else (default)
+ * Configuration for one Profile Queue.
+ * drop_n  : throw away this many packets out of every PACKETS_PER_GROUP
+ * dup_n   : make an extra copy of this many packets out of every PACKETS_PER_GROUP
+ * delay_us: hold each packet this many microseconds before forwarding (0 = no delay)
  */
 struct pq_config {
 	const char *name;
@@ -98,37 +252,53 @@ struct pq_config {
 	uint64_t    delay_us;
 };
 
+/*
+ * The 10 hardcoded Profile Queues.
+ * Classification order is defined in classify_packet() below.
+ *
+ * PQ 0 – ICMP             : drop 2/10
+ * PQ 1 – HTTP  (TCP 80)   : duplicate 2/10
+ * PQ 2 – HTTPS (TCP 443)  : delay 1 ms
+ * PQ 3 – SSH   (TCP 22)   : drop 1/10, delay 100 us
+ * PQ 4 – DNS   (UDP 53)   : delay 500 us
+ * PQ 5 – NTP   (UDP 123)  : drop 1/10
+ * PQ 6 – src 10.0.0.0/24  : duplicate 3/10
+ * PQ 7 – src 192.168.0/24 : drop 3/10
+ * PQ 8 – TCP port < 1024  : delay 2 ms
+ * PQ 9 – everything else  : pass through unchanged
+ */
 static const struct pq_config pq_configs[NUM_PQ] = {
-	[0] = { "ICMP",             2, 0, 0    },
-	[1] = { "HTTP(80)",         0, 2, 0    },
-	[2] = { "HTTPS(443)",       0, 0, 1000 },
-	[3] = { "SSH(22)",          1, 0, 100  },
-	[4] = { "DNS(53)",          0, 0, 500  },
-	[5] = { "NTP(123)",         1, 0, 0    },
-	[6] = { "src 10.0.0.0/24",  0, 3, 0   },
-	[7] = { "src 192.168.0/24", 3, 0, 0   },
-	[8] = { "TCP<1024",         0, 0, 2000 },
-	[9] = { "default",          0, 0, 0   },
+	[0] = { "proto=ICMP",           .drop_n = 2, .dup_n = 0, .delay_us = 0    },
+	[1] = { "payload=HTTP",         .drop_n = 0, .dup_n = 2, .delay_us = 0    },
+	[2] = { "payload=TLS",          .drop_n = 0, .dup_n = 0, .delay_us = 1000 },
+	[3] = { "payload=SSH",          .drop_n = 1, .dup_n = 0, .delay_us = 100  },
+	[4] = { "payload=DNS",          .drop_n = 0, .dup_n = 0, .delay_us = 500  },
+	[5] = { "payload=NTP",          .drop_n = 1, .dup_n = 0, .delay_us = 0    },
+	[6] = { "src=10.0.0.0/24",      .drop_n = 0, .dup_n = 3, .delay_us = 0   },
+	[7] = { "src=192.168.0.0/24",   .drop_n = 3, .dup_n = 0, .delay_us = 0   },
+	[8] = { "size<128B",            .drop_n = 0, .dup_n = 0, .delay_us = 2000 },
+	[9] = { "default",              .drop_n = 0, .dup_n = 0, .delay_us = 0   },
 };
 
-/* Entry in a per-PQ delay ring */
+/* one slot in a PQ's delay ring */
 struct delay_entry {
 	struct rte_mbuf *m;
-	uint64_t         release_tsc;
+	uint64_t         release_tsc; /* send when rte_rdtsc() >= this */
 };
 
 /*
- * Per-lcore, per-PQ state.  Each lcore owns its own copy exclusively —
- * no sharing, no locks needed.
+ * All state for one Profile Queue on one lcore.
+ * Each lcore keeps its own private copy — no sharing, no locks needed.
  */
 struct pq_state {
-	uint64_t         pkt_count;
+	uint64_t           pkt_count; /* how many packets we've seen in this PQ total */
 	struct delay_entry delay_q[DELAY_QUEUE_SIZE];
-	uint32_t         dq_head;
-	uint32_t         dq_tail;
-	uint32_t         dq_count;
+	uint32_t           dq_head;   /* oldest entry (next to dequeue) */
+	uint32_t           dq_tail;   /* next free slot (next to enqueue) */
+	uint32_t           dq_count;  /* how many entries are in the ring right now */
 } __rte_cache_aligned;
 
+/* per-lcore state: one set of PQ states for each of the 10 queues */
 struct lcore_state {
 	struct pq_state pqs[NUM_PQ];
 } __rte_cache_aligned;
@@ -136,18 +306,21 @@ struct lcore_state {
 static struct lcore_state lcore_states[RTE_MAX_LCORE];
 
 /* ------------------------------------------------------------------ */
+/* Stats                                                                */
+/* ------------------------------------------------------------------ */
 
 static void
 print_stats(void)
 {
 	const char clr[]     = { 27, '[', '2', 'J', '\0' };
-	const char topLeft[] = { 27, '[', '1', ';', '1', 'H', '\0' };
-	printf("%s%s", clr, topLeft);
+	const char topleft[] = { 27, '[', '1', ';', '1', 'H', '\0' };
+	printf("%s%s", clr, topleft);
 
 	uint64_t ttx = 0, trx = 0, tdrop = 0, tdup = 0, tdelay = 0;
+
 	printf("\nPort statistics ====================================");
 	for (unsigned p = 0; p < NB_PORTS; p++) {
-		printf("\n  Port %u: rx=%-10"PRIu64" tx=%-10"PRIu64
+		printf("\n  Port %u | rx=%-10"PRIu64" tx=%-10"PRIu64
 		       " drop=%-8"PRIu64" dup=%-8"PRIu64" delay=%-8"PRIu64,
 		       p,
 		       port_statistics[p].rx,
@@ -161,87 +334,127 @@ print_stats(void)
 		tdup   += port_statistics[p].duplicated;
 		tdelay += port_statistics[p].delayed;
 	}
-	printf("\n  Total : rx=%-10"PRIu64" tx=%-10"PRIu64
+	printf("\n  Total  | rx=%-10"PRIu64" tx=%-10"PRIu64
 	       " drop=%-8"PRIu64" dup=%-8"PRIu64" delay=%-8"PRIu64,
 	       trx, ttx, tdrop, tdup, tdelay);
 
-	printf("\nProfile Queue config ================================");
-	for (int pq = 0; pq < NUM_PQ; pq++)
+	printf("\n\nProfile Queue config ================================");
+	for (int pq = 0; pq < NUM_PQ; pq++) {
 		printf("\n  PQ%d [%-18s] drop=%u/10  dup=%u/10  delay=%"PRIu64"us",
-		       pq, pq_configs[pq].name,
+		       pq,
+		       pq_configs[pq].name,
 		       pq_configs[pq].drop_n,
 		       pq_configs[pq].dup_n,
 		       pq_configs[pq].delay_us);
+	}
 	printf("\n====================================================\n");
 	fflush(stdout);
 }
 
 /* ------------------------------------------------------------------ */
+/* Packet classification                                                */
+/* ------------------------------------------------------------------ */
 
 /*
- * Classify an incoming packet into one of the 10 PQs.
- * Returns PQ index 0-9.  Non-IPv4 → PQ 9.
+ * Classify a packet into one of the 10 Profile Queues using payload
+ * pattern matching — we actually look inside the packet bytes rather than
+ * trusting port numbers (which can be wrong or spoofed).
+ *
+ * Classification map (first match wins):
+ *   PQ 0 — ICMP protocol field
+ *   PQ 1 — HTTP  payload: starts with GET/POST/PUT/DELETE/HEAD/OPTIONS/HTTP
+ *   PQ 2 — TLS   payload: TLS record header bytes (covers HTTPS, SMTPS, etc.)
+ *   PQ 3 — SSH   payload: starts with "SSH-"
+ *   PQ 4 — DNS   payload: standard DNS message structure in UDP
+ *   PQ 5 — NTP   payload: NTP packet structure in UDP
+ *   PQ 6 — src IP in 10.0.0.0/24
+ *   PQ 7 — src IP in 192.168.0.0/24
+ *   PQ 8 — small packet (total IP length < 128 bytes, not matched above)
+ *   PQ 9 — everything else
  */
 static uint16_t
 classify_packet(struct rte_mbuf *m)
 {
-	if (unlikely(rte_pktmbuf_data_len(m) < sizeof(struct rte_ether_hdr)))
+	uint32_t data_len = rte_pktmbuf_data_len(m);
+
+	if (unlikely(data_len < sizeof(struct rte_ether_hdr) +
+	                         sizeof(struct rte_ipv4_hdr)))
 		return 9;
 
-	struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+	struct rte_ether_hdr *eth = PKT_ETH(m);
 	if (rte_be_to_cpu_16(eth->ether_type) != RTE_ETHER_TYPE_IPV4)
 		return 9;
 
-	uint32_t data_len = rte_pktmbuf_data_len(m);
-	if (unlikely(data_len < sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)))
-		return 9;
+	struct rte_ipv4_hdr *ip = PKT_IP(m);
+	uint8_t  proto          = ip->next_proto_id;
+	uint32_t src_ip         = rte_be_to_cpu_32(ip->src_addr);
+	uint32_t ip_hdr_len     = IP_HDR_LEN(ip);
 
-	struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
-	uint8_t  proto  = ip->next_proto_id;
-	uint32_t src_ip = rte_be_to_cpu_32(ip->src_addr);
-	uint32_t ihl    = (ip->version_ihl & 0x0f) * 4;
-
-	/* PQ 0: ICMP */
-	if (proto == IPPROTO_ICMP)
+	/* PQ 0 — ICMP: matched at protocol level, no payload needed */
+	if (proto == PROTO_ICMP)
 		return 0;
 
-	/* PQ 6: src 10.0.0.0/24 */
-	if ((src_ip >> 8) == (0x0A000000 >> 8))
-		return 6;
+	/* PQ 6 / PQ 7 — source IP prefix pattern */
+	if (IP_IN_SLASH24(src_ip, NET_10_0_0))    return 6;
+	if (IP_IN_SLASH24(src_ip, NET_192_168_0)) return 7;
 
-	/* PQ 7: src 192.168.0.0/24 */
-	if ((src_ip >> 8) == (0xC0A80000 >> 8))
-		return 7;
+	/* make sure we have at least the L4 header */
+	uint32_t l4_offset = sizeof(struct rte_ether_hdr) + ip_hdr_len;
+	if (unlikely(data_len <= l4_offset))
+		return 9;
 
-	uint8_t *l4 = (uint8_t *)ip + ihl;
+	uint8_t *l4     = (uint8_t *)ip + ip_hdr_len;
+	uint32_t l4_len = data_len - l4_offset;
 
-	if (proto == IPPROTO_TCP) {
-		if (unlikely(data_len < sizeof(struct rte_ether_hdr) + ihl +
-		                        sizeof(struct rte_tcp_hdr)))
+	/* PQ 1/2/3/8 — TCP: inspect payload bytes */
+	if (proto == PROTO_TCP) {
+		if (unlikely(l4_len < sizeof(struct rte_tcp_hdr)))
 			return 9;
-		uint16_t dport = rte_be_to_cpu_16(((struct rte_tcp_hdr *)l4)->dst_port);
-		if (dport == 80)   return 1;
-		if (dport == 443)  return 2;
-		if (dport == 22)   return 3;
-		if (dport < 1024)  return 8;
+
+		uint8_t *payload     = TCP_PAYLOAD(l4);
+		uint32_t payload_len = TCP_PAYLOAD_LEN(l4, l4_len);
+
+		if (IS_HTTP(payload, payload_len)) return 1;
+		if (IS_TLS(payload, payload_len))  return 2;
+		if (IS_SSH(payload, payload_len))  return 3;
+
+		/* PQ 8 — small TCP packet not matched above */
+		if (IS_SMALL_PKT(ip)) return 8;
+
 		return 9;
 	}
 
-	if (proto == IPPROTO_UDP) {
-		if (unlikely(data_len < sizeof(struct rte_ether_hdr) + ihl +
-		                        sizeof(struct rte_udp_hdr)))
+	/* PQ 4/5 — UDP: inspect payload bytes */
+	if (proto == PROTO_UDP) {
+		if (unlikely(l4_len < sizeof(struct rte_udp_hdr)))
 			return 9;
-		uint16_t dport = rte_be_to_cpu_16(((struct rte_udp_hdr *)l4)->dst_port);
-		if (dport == 53)  return 4;
-		if (dport == 123) return 5;
+
+		uint8_t *payload     = UDP_PAYLOAD(l4);
+		uint32_t payload_len = UDP_PAYLOAD_LEN(l4_len);
+
+		if (IS_DNS(payload, payload_len)) return 4;
+		if (IS_NTP(payload, payload_len)) return 5;
+
+		/* PQ 8 — small UDP packet not matched above */
+		if (IS_SMALL_PKT(ip)) return 8;
+
 		return 9;
 	}
+
+	/* PQ 8 — small packet of any other protocol */
+	if (IS_SMALL_PKT(ip)) return 8;
 
 	return 9;
 }
 
 /* ------------------------------------------------------------------ */
+/* Delay ring operations                                                */
+/* ------------------------------------------------------------------ */
 
+/*
+ * Put a packet in the delay ring.
+ * If the ring is full we drop the packet rather than crashing.
+ */
 static inline void
 delay_enqueue(struct pq_state *pqs, struct rte_mbuf *m, uint64_t release_tsc)
 {
@@ -251,27 +464,32 @@ delay_enqueue(struct pq_state *pqs, struct rte_mbuf *m, uint64_t release_tsc)
 	}
 	pqs->delay_q[pqs->dq_tail].m           = m;
 	pqs->delay_q[pqs->dq_tail].release_tsc = release_tsc;
-	pqs->dq_tail = (pqs->dq_tail + 1) % DELAY_QUEUE_SIZE;
+	pqs->dq_tail  = RING_NEXT(pqs->dq_tail, DELAY_QUEUE_SIZE);
 	pqs->dq_count++;
 }
 
 /*
- * Release all delay-queue entries whose deadline has passed.
- * Within a single PQ, entries are always chronologically ordered
- * (same delay_us applied to a monotonically increasing cur_tsc),
- * so we can break on the first unexpired entry.
+ * Walk every PQ's delay ring and forward any packet whose timer has expired.
+ *
+ * Within a single PQ all packets have the same delay_us value, and we enqueue
+ * them in arrival order, so release_tsc is monotonically increasing from head
+ * to tail. That means we can stop as soon as we hit one that is not ready yet —
+ * nothing behind it will be ready either.
  */
 static void
 flush_delay_queues(struct lcore_state *ls, uint16_t tx_port_id, uint64_t cur_tsc)
 {
 	for (int pq = 0; pq < NUM_PQ; pq++) {
 		struct pq_state *pqs = &ls->pqs[pq];
+
 		while (pqs->dq_count > 0) {
 			if (pqs->delay_q[pqs->dq_head].release_tsc > cur_tsc)
 				break;
+
 			struct rte_mbuf *m = pqs->delay_q[pqs->dq_head].m;
-			pqs->dq_head = (pqs->dq_head + 1) % DELAY_QUEUE_SIZE;
+			pqs->dq_head  = RING_NEXT(pqs->dq_head, DELAY_QUEUE_SIZE);
 			pqs->dq_count--;
+
 			int sent = rte_eth_tx_buffer(tx_port_id, 0,
 			                             tx_buffer[tx_port_id], m);
 			if (sent)
@@ -281,32 +499,42 @@ flush_delay_queues(struct lcore_state *ls, uint16_t tx_port_id, uint64_t cur_tsc
 }
 
 /* ------------------------------------------------------------------ */
+/* Per-packet processing                                                */
+/* ------------------------------------------------------------------ */
 
-static inline void
-forward_mbuf(struct rte_mbuf *m, uint16_t pq_id,
-             uint16_t rx_port_id, uint16_t tx_port_id,
-             struct lcore_state *ls, uint64_t cur_tsc,
-             uint64_t tsc_per_us)
+/*
+ * Apply the PQ rules (drop / duplicate / delay) to one packet and either
+ * send it, queue it for later, or throw it away.
+ *
+ * Processing order: drop first, then duplicate, then delay/send.
+ * This means duplicates are never made for packets that would be dropped.
+ */
+static void
+process_packet(struct rte_mbuf *m,
+               uint16_t rx_port_id, uint16_t tx_port_id,
+               struct lcore_state *ls,
+               uint64_t cur_tsc, uint64_t tsc_per_us)
 {
+	uint16_t pq_id             = classify_packet(m);
 	const struct pq_config *cfg = &pq_configs[pq_id];
 	struct pq_state        *pqs = &ls->pqs[pq_id];
-	uint64_t count = pqs->pkt_count++;
+	uint64_t count              = pqs->pkt_count++;
 
-	/* Drop */
-	if (cfg->drop_n > 0 && (count % 10) < cfg->drop_n) {
+	/* --- DROP ---------------------------------------------------- */
+	if (SHOULD_DROP(count, cfg->drop_n)) {
 		rte_pktmbuf_free(m);
 		port_statistics[rx_port_id].dropped++;
 		return;
 	}
 
-	/* Duplicate: enqueue a copy ahead of the original */
-	if (cfg->dup_n > 0 && (count % 10) < cfg->dup_n) {
+	/* --- DUPLICATE ----------------------------------------------- */
+	if (SHOULD_DUP(count, cfg->dup_n)) {
 		struct rte_mbuf *clone = rte_pktmbuf_copy(m, netem_pktmbuf_pool,
 		                                           0, UINT32_MAX);
 		if (likely(clone != NULL)) {
 			if (cfg->delay_us > 0)
 				delay_enqueue(pqs, clone,
-				              cur_tsc + cfg->delay_us * tsc_per_us);
+				              RELEASE_TSC(cur_tsc, cfg->delay_us, tsc_per_us));
 			else {
 				int sent = rte_eth_tx_buffer(tx_port_id, 0,
 				                             tx_buffer[tx_port_id], clone);
@@ -317,9 +545,9 @@ forward_mbuf(struct rte_mbuf *m, uint16_t pq_id,
 		}
 	}
 
-	/* Delay or forward immediately */
+	/* --- DELAY or FORWARD ---------------------------------------- */
 	if (cfg->delay_us > 0) {
-		delay_enqueue(pqs, m, cur_tsc + cfg->delay_us * tsc_per_us);
+		delay_enqueue(pqs, m, RELEASE_TSC(cur_tsc, cfg->delay_us, tsc_per_us));
 		port_statistics[rx_port_id].delayed++;
 	} else {
 		int sent = rte_eth_tx_buffer(tx_port_id, 0, tx_buffer[tx_port_id], m);
@@ -329,6 +557,8 @@ forward_mbuf(struct rte_mbuf *m, uint16_t pq_id,
 }
 
 /* ------------------------------------------------------------------ */
+/* Main processing loop (one per lcore)                                 */
+/* ------------------------------------------------------------------ */
 
 static void
 netem_main_loop(void)
@@ -336,31 +566,38 @@ netem_main_loop(void)
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	unsigned lcore_id = rte_lcore_id();
 
-	/* lcore 0 → rx port 0 → tx port 1; lcore 1 → rx port 1 → tx port 0 */
+	/*
+	 * lcore 0 reads port 0 and sends to port 1.
+	 * lcore 1 reads port 1 and sends to port 0.
+	 * XOR with 1 flips the last bit, so 0 -> 1 and 1 -> 0.
+	 */
 	uint16_t rx_port_id = (uint16_t)lcore_id;
 	uint16_t tx_port_id = rx_port_id ^ 1;
 
+	/* initialise this lcore's private PQ state — no other lcore touches this */
 	struct lcore_state *ls = &lcore_states[lcore_id];
 	memset(ls, 0, sizeof(*ls));
 
-	uint64_t tsc_hz      = rte_get_tsc_hz();
-	uint64_t tsc_per_us  = tsc_hz / 1000000;
+	uint64_t tsc_hz     = rte_get_tsc_hz();
+	uint64_t tsc_per_us = TSC_PER_US(tsc_hz);
+
+	/* how many TSC ticks is BURST_TX_DRAIN_US microseconds? */
 	const uint64_t drain_tsc = (tsc_hz + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
 
 	uint64_t prev_tsc  = 0;
 	uint64_t timer_tsc = 0;
 
-	printf("lcore %u: rx port %u → tx port %u\n",
+	printf("lcore %u started: rx=port%u  tx=port%u\n",
 	       lcore_id, rx_port_id, tx_port_id);
 	RTE_LOG(INFO, NETEM, "entering main loop on lcore %u\n", lcore_id);
 
 	while (!force_quit) {
 		uint64_t cur_tsc = rte_rdtsc();
 
-		/* Release any delay-queue packets whose time has come */
+		/* release any delayed packets whose timer has expired */
 		flush_delay_queues(ls, tx_port_id, cur_tsc);
 
-		/* Periodic TX drain + stats */
+		/* every BURST_TX_DRAIN_US: flush TX buffer + maybe print stats */
 		if (unlikely(cur_tsc - prev_tsc > drain_tsc)) {
 			int sent = rte_eth_tx_buffer_flush(tx_port_id, 0,
 			                                   tx_buffer[tx_port_id]);
@@ -379,7 +616,7 @@ netem_main_loop(void)
 			prev_tsc = cur_tsc;
 		}
 
-		/* RX burst */
+		/* grab a burst of incoming packets */
 		unsigned nb_rx = rte_eth_rx_burst(rx_port_id, 0,
 		                                  pkts_burst, MAX_PKT_BURST);
 		if (unlikely(nb_rx == 0))
@@ -388,11 +625,12 @@ netem_main_loop(void)
 		port_statistics[rx_port_id].rx += nb_rx;
 
 		for (unsigned i = 0; i < nb_rx; i++) {
+			/* hint to the CPU: start loading the next packet's data
+			 * into cache while we're still working on this one */
 			rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[i], void *));
-			uint16_t pq_id = classify_packet(pkts_burst[i]);
-			forward_mbuf(pkts_burst[i], pq_id,
-			             rx_port_id, tx_port_id,
-			             ls, cur_tsc, tsc_per_us);
+			process_packet(pkts_burst[i],
+			               rx_port_id, tx_port_id,
+			               ls, cur_tsc, tsc_per_us);
 		}
 	}
 }
@@ -413,6 +651,10 @@ signal_handler(int signum)
 	}
 }
 
+/* ------------------------------------------------------------------ */
+/* Startup                                                              */
+/* ------------------------------------------------------------------ */
+
 int
 main(int argc, char **argv)
 {
@@ -422,6 +664,7 @@ main(int argc, char **argv)
 	uint16_t portid;
 	unsigned lcore_id;
 
+	/* init EAL — this grabs the CPU cores, sets up memory, opens NICs */
 	ret = rte_eal_init(argc, argv);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid EAL arguments\n");
@@ -432,16 +675,23 @@ main(int argc, char **argv)
 	signal(SIGINT,  signal_handler);
 	signal(SIGTERM, signal_handler);
 
+	/* convert timer_period from seconds to TSC ticks */
 	timer_period *= rte_get_timer_hz();
 
 	nb_ports = rte_eth_dev_count_avail();
 	if (nb_ports == 0)
-		rte_exit(EXIT_FAILURE, "No Ethernet ports\n");
+		rte_exit(EXIT_FAILURE, "No Ethernet ports found\n");
 
+	/*
+	 * Size the mempool so we have enough mbufs for:
+	 *   - RX/TX descriptors for each port
+	 *   - in-flight burst buffers
+	 *   - mempool caches per lcore
+	 *   - all the delay rings + duplicates we might have in flight at once
+	 */
 	unsigned nb_mbufs = RTE_MAX(
 		nb_ports * (nb_rxd + nb_txd + MAX_PKT_BURST + 2 * MEMPOOL_CACHE_SIZE),
 		8192U);
-	/* Extra headroom for delay queues and duplication clones */
 	nb_mbufs += NB_PORTS * NUM_PQ * DELAY_QUEUE_SIZE * 2;
 
 	netem_pktmbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", nb_mbufs,
@@ -449,6 +699,7 @@ main(int argc, char **argv)
 	if (netem_pktmbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 
+	/* initialise each port */
 	RTE_ETH_FOREACH_DEV(portid) {
 		struct rte_eth_rxconf   rxq_conf;
 		struct rte_eth_txconf   txq_conf;
@@ -462,7 +713,7 @@ main(int argc, char **argv)
 		ret = rte_eth_dev_info_get(portid, &dev_info);
 		if (ret != 0)
 			rte_exit(EXIT_FAILURE,
-			         "Error during getting device (port %u) info: %s\n",
+			         "Error getting device info (port %u): %s\n",
 			         portid, strerror(-ret));
 
 		if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
@@ -471,18 +722,19 @@ main(int argc, char **argv)
 		ret = rte_eth_dev_configure(portid, 1, 1, &local_port_conf);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE,
-			         "Cannot configure device: err=%d, port=%u\n", ret, portid);
+			         "Cannot configure port %u: err=%d\n", portid, ret);
 
 		ret = rte_eth_dev_adjust_nb_rx_tx_desc(portid, &nb_rxd, &nb_txd);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE,
-			         "Cannot adjust descriptors: err=%d, port=%u\n", ret, portid);
+			         "Cannot adjust descriptors port %u: err=%d\n", portid, ret);
 
 		ret = rte_eth_macaddr_get(portid, &netem_ports_eth_addr[portid]);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE,
-			         "Cannot get MAC address: err=%d, port=%u\n", ret, portid);
+			         "Cannot get MAC port %u: err=%d\n", portid, ret);
 
+		/* set up one RX queue per port, backed by our mempool */
 		rxq_conf          = dev_info.default_rxconf;
 		rxq_conf.offloads = local_port_conf.rxmode.offloads;
 		ret = rte_eth_rx_queue_setup(portid, 0, nb_rxd,
@@ -490,16 +742,18 @@ main(int argc, char **argv)
 		                             &rxq_conf, netem_pktmbuf_pool);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE,
-			         "rte_eth_rx_queue_setup: err=%d, port=%u\n", ret, portid);
+			         "rx_queue_setup err=%d port=%u\n", ret, portid);
 
+		/* set up one TX queue per port */
 		txq_conf          = dev_info.default_txconf;
 		txq_conf.offloads = local_port_conf.txmode.offloads;
 		ret = rte_eth_tx_queue_setup(portid, 0, nb_txd,
 		                             rte_eth_dev_socket_id(portid), &txq_conf);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE,
-			         "rte_eth_tx_queue_setup: err=%d, port=%u\n", ret, portid);
+			         "tx_queue_setup err=%d port=%u\n", ret, portid);
 
+		/* allocate the TX burst buffer for this port */
 		tx_buffer[portid] = rte_zmalloc_socket("tx_buffer",
 			RTE_ETH_TX_BUFFER_SIZE(MAX_PKT_BURST), 0,
 			rte_eth_dev_socket_id(portid));
@@ -509,6 +763,7 @@ main(int argc, char **argv)
 
 		rte_eth_tx_buffer_init(tx_buffer[portid], MAX_PKT_BURST);
 
+		/* count packets that couldn't be sent as dropped */
 		ret = rte_eth_tx_buffer_set_err_callback(tx_buffer[portid],
 			rte_eth_tx_buffer_count_callback,
 			&port_statistics[portid].dropped);
@@ -523,7 +778,7 @@ main(int argc, char **argv)
 		ret = rte_eth_dev_start(portid);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE,
-			         "rte_eth_dev_start: err=%d, port=%u\n", ret, portid);
+			         "rte_eth_dev_start err=%d port=%u\n", ret, portid);
 
 		printf("Port %u, MAC address: " RTE_ETHER_ADDR_PRT_FMT "\n\n",
 		       portid,
@@ -535,6 +790,7 @@ main(int argc, char **argv)
 	if (!nb_ports_available)
 		rte_exit(EXIT_FAILURE, "No ports available\n");
 
+	/* launch the main loop on every available lcore simultaneously */
 	ret = 0;
 	rte_eal_mp_remote_launch(netem_launch_one_lcore, NULL, CALL_MAIN);
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {
@@ -544,6 +800,7 @@ main(int argc, char **argv)
 		}
 	}
 
+	/* clean shutdown */
 	RTE_ETH_FOREACH_DEV(portid) {
 		printf("Closing port %d...", portid);
 		ret = rte_eth_dev_stop(portid);
