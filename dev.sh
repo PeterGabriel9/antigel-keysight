@@ -5,6 +5,8 @@ IMAGE="netem_challenge"
 CONTAINER="netem_container"
 INTERNAL_PORT=7681
 HOST_PORT=8000
+DASHBOARD_INTERNAL=9000
+DASHBOARD_HOST=9000
 
 usage() {
     echo "Usage: $0 [command]"
@@ -49,12 +51,14 @@ cmd_start() {
     docker run -d \
         --name "$CONTAINER" \
         -p "$HOST_PORT:$INTERNAL_PORT" \
+        -p "$DASHBOARD_HOST:$DASHBOARD_INTERNAL" \
         --memory="1g" \
         --cpus="2" \
         --restart unless-stopped \
         "$IMAGE"
     echo "==> Container started."
     echo "    Browser terminal: http://localhost:$HOST_PORT  (student / keysight2026)"
+    echo "    NETEM dashboard:  http://localhost:$DASHBOARD_HOST  (starts when netem runs)"
     echo "    Shell:            $0 shell"
 }
 
@@ -68,8 +72,10 @@ cmd_update() {
         echo "Container is not running. Run: $0 start"
         exit 1
     fi
-    echo "==> Copying main.c into container..."
-    docker cp netem/main.c "$CONTAINER":/home/student/challenge-app/netem/main.c
+    echo "==> Copying source files into container..."
+    for f in netem/main.c netem/http.c netem/http.h netem/netem.h netem/meson.build; do
+        docker cp "$f" "$CONTAINER":/home/student/challenge-app/"$f"
+    done
     echo "==> Recompiling inside container..."
     docker exec "$CONTAINER" bash -c "cd /home/student/challenge-app/netem && ninja -C build"
     echo "==> Done. Run: $0 run"

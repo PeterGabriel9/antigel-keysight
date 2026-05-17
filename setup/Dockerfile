@@ -16,6 +16,7 @@ RUN apt update && apt install -y curl \
         libnuma-dev \
         libpcap-dev \
         libelf-dev \
+        libmicrohttpd-dev \
         && rm -rf /var/lib/apt/lists/*
 
 # Setup student user
