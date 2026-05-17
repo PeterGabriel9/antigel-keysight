@@ -34,7 +34,7 @@ RUN cd /home/student/dpdk && ninja -C build install && ldconfig
 
 # Setup the challenge app (done as student to ensure correct permissions)
 USER student
-RUN cd /home/student  && git clone https://github.com/cchenaru/keysight-challenge-2026.git challenge-app
+RUN cd /home/student  && git clone https://github.com/PeterGabriel9/antigel-keysight.git challenge-app
 
 RUN cd /home/student/challenge-app/netem && meson setup build
 

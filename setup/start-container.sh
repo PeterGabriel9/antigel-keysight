@@ -12,7 +12,7 @@ echo "Starting container ..."
 
 # Generate unique name and port
 CONTAINER_NAME="netem_container"
-HOST_PORT=$((BASE_PORT + i))
+HOST_PORT=$BASE_PORT
 
 # Run the container
 docker run -d \
