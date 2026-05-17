@@ -10,10 +10,7 @@
 
 static struct MHD_Daemon *daemon_handle = NULL;
 
-/* ------------------------------------------------------------------ */
-/* embedded HTML dashboard                                              */
-/* single-file app: bootstrap + chart.js from CDN, vanilla JS polling  */
-/* ------------------------------------------------------------------ */
+// single-file dashboard - Bootstrap + Chart.js from CDN, polls /api/stats every 500ms
 
 static const char DASHBOARD[] =
 "<!DOCTYPE html>"
@@ -279,9 +276,7 @@ static const char DASHBOARD[] =
 "</body>"
 "</html>";
 
-/* ------------------------------------------------------------------ */
-/* JSON building                                                        */
-/* ------------------------------------------------------------------ */
+// build the JSON blob for GET /api/stats
 
 static void
 build_stats_json(char *buf, size_t bufsz)
@@ -318,10 +313,7 @@ build_stats_json(char *buf, size_t bufsz)
 	n += snprintf(buf + n, bufsz - n, "]}");
 }
 
-/* ------------------------------------------------------------------ */
-/* JSON config parsing — no extra deps, just strstr + atoi             */
-/* expected body: {"pq":N,"drop_n":N} etc, one field at a time        */
-/* ------------------------------------------------------------------ */
+// parse POST /api/config body - just strstr + atoi, no fancy JSON lib needed
 
 static void
 parse_config_update(const char *json)
@@ -343,9 +335,6 @@ parse_config_update(const char *json)
 	if (p) { p = strchr(p, ':'); if (p) pq_configs[pq_id].delay_us = (uint64_t)strtoull(p + 1, NULL, 10); }
 }
 
-/* ------------------------------------------------------------------ */
-/* MHD helpers                                                          */
-/* ------------------------------------------------------------------ */
 
 static enum MHD_Result
 respond(struct MHD_Connection *conn, unsigned int code,
@@ -360,18 +349,12 @@ respond(struct MHD_Connection *conn, unsigned int code,
 	return r;
 }
 
-/* ------------------------------------------------------------------ */
-/* per-connection state for collecting POST body                        */
-/* ------------------------------------------------------------------ */
 
 struct conn_state {
 	char   body[4096];
 	size_t len;
 };
 
-/* ------------------------------------------------------------------ */
-/* request handler                                                      */
-/* ------------------------------------------------------------------ */
 
 static enum MHD_Result
 handle_request(void *cls,
@@ -385,7 +368,7 @@ handle_request(void *cls,
 {
 	(void)cls; (void)version;
 
-	/* first call for this connection: allocate per-connection state */
+	/* first call for this connection */
 	if (*con_cls == NULL) {
 		struct conn_state *cs = calloc(1, sizeof(*cs));
 		if (!cs) return MHD_NO;
@@ -411,7 +394,7 @@ handle_request(void *cls,
 
 	/* ---- POST /api/config ---- */
 	if (strcmp(method, "POST") == 0 && strcmp(url, "/api/config") == 0) {
-		/* accumulate body across multiple upload_data calls */
+		/* read body chunks until upload_data_size drops to 0 */
 		if (*upload_data_size > 0) {
 			size_t take = *upload_data_size;
 			if (cs->len + take >= sizeof(cs->body) - 1)
@@ -422,7 +405,7 @@ handle_request(void *cls,
 			*upload_data_size = 0;
 			return MHD_YES;
 		}
-		/* all body received — apply the config update */
+		/* done reading, apply it */
 		parse_config_update(cs->body);
 		return respond(conn, MHD_HTTP_OK, "application/json",
 		               "{\"ok\":true}", 11);
@@ -440,9 +423,6 @@ request_done(void *cls, struct MHD_Connection *conn,
 	*con_cls = NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/* start / stop                                                         */
-/* ------------------------------------------------------------------ */
 
 void
 http_server_start(int port)
