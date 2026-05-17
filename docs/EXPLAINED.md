@@ -1,233 +1,190 @@
-# How the Network Emulator Works — Explained Simply
+# Cum functioneaza emulator-ul de retea — pe intelesul tuturor
+**(How the Network Emulator Works — explained simply)**
 
-Imagine you are a postal worker inside a giant post office.
-Trucks drop off packages (packets) at your door all day long.
-Your job is to sort those packages, mess with some of them on purpose,
-and then send them out the other door.
+Sa ne imaginam ca suntem un postal worker intr-un oficiu postal imens.
+Camioane vin si lasa pachete (network packets) la usa noastra non-stop.
+Job-ul nostru: sortam pachetele, aplicam niste reguli unora intentionat,
+si le trimitem mai departe pe alta usa.
 
-That is literally what this program does — but with network packets instead of boxes.
+Asta face exact programul asta — dar cu network packets in loc de cutii fizice.
 
 ---
 
-## The Big Picture
+## Imaginea generala
 
 ```
-Internet packets come in
+Packets vin din retea
         |
         v
-  [ We receive them ]
+  [ Le primim ]
         |
         v
-  [ We look at each one and decide which "pile" it belongs to ]
+  [ Decidem in ce "gramada" merge fiecare ]
         |
         v
-  [ We apply rules to that pile: throw some away, copy some, slow some down ]
+  [ Aplicam regulile: drop, dup, delay ]
         |
         v
-  [ We send the survivors out ]
+  [ Trimitem ce a supravietuit ]
 ```
 
-There are **two doors** (ports). One lcore (a CPU thread) handles each door.
-- Thread 0 reads from door 0, sends out door 1.
-- Thread 1 reads from door 1, sends out door 0.
+There are **two ports** (doors). One CPU thread (lcore) handles each door.
+- Thread 0 reads from port 0, sends out port 1.
+- Thread 1 reads from port 1, sends out port 0.
 
-They never talk to each other. They never share a notepad. Totally independent.
-
----
-
-## What is a "packet"?
-
-A packet is just a small chunk of data travelling over a network.
-Think of it as an envelope. The envelope has:
-- An **Ethernet header** — like the outside of the envelope (who sent it, to whom)
-- An **IP header** — the city/street address
-- A **TCP or UDP header** — the apartment number
-- The actual **data** inside
-
-In C, DPDK gives us each packet as a pointer called `struct rte_mbuf *m`.
-It is just a struct that holds a pointer to the raw bytes of the envelope.
+Nu comunica intre ei. Sunt complet independenti.
 
 ---
 
-## Part 1 — Receiving packets (`rte_eth_rx_burst`)
+## Ce e un "packet"?
+
+A packet is just a small chunk of data traveling over the network.
+Think of it like an envelope. The envelope has:
+- **Ethernet header** — cine l-a trimis si catre cine (outside of envelope)
+- **IP header** — the address (oras, strada)
+- **TCP/UDP header** — numarul apartamentului
+- **Data** — continutul efectiv
+
+In C, DPDK gives us each packet as a pointer: `struct rte_mbuf *m`.
+Is just a struct that holds a pointer to raw bytes of packet.
+
+---
+
+## Pasul 1 — Primim pachetele (`rte_eth_rx_burst`)
 
 ```c
 unsigned nb_rx = rte_eth_rx_burst(rx_port_id, 0, pkts_burst, MAX_PKT_BURST);
 ```
 
 This is like opening the mailbox and grabbing up to 32 envelopes at once.
-`pkts_burst` is an array of 32 pointers, each pointing to one packet.
-`nb_rx` tells us how many we actually got (could be 0 if nobody sent anything yet).
+`nb_rx` tells us how many we actually got — can be 0 if nothing arrived yet.
 
-We do this in a loop forever until someone presses Ctrl+C.
+Facem asta intr-o bucla infinita pana cineva apasa Ctrl+C.
 
 ---
 
-## Part 2 — The 10 Sorting Piles (Profile Queues)
+## Pasul 2 — Cele 10 gramezi (Profile Queues)
 
 We have 10 piles on our desk. Every incoming packet goes into exactly one pile.
-We call them **Profile Queues (PQ 0 through PQ 9)**.
+We call them **Profile Queues — PQ 0 pana la PQ 9**.
 
-The function that decides which pile is `classify_packet(m)`.
-It returns a number from 0 to 9.
+The function `classify_packet(m)` decides which pile. It returns a number from 0 to 9.
 
-How does it decide? It peeks inside the envelope:
+Cum decide? Se uita direct in continutul packetului, nu in numarul de port.
+(Numerele de port sunt inutile — poti rula orice protocol pe orice port.)
+Instead we look at the actual bytes in the payload and check for known signatures:
 
 ```
-Is it an ICMP packet?          → pile 0  (like a ping, a "hello are you there?")
-Is it going to port 80?        → pile 1  (HTTP, normal web traffic)
-Is it going to port 443?       → pile 2  (HTTPS, secure web traffic)
-Is it going to port 22?        → pile 3  (SSH, remote terminal)
-Is it going to UDP port 53?    → pile 4  (DNS, "what is the address of google.com?")
-Is it going to UDP port 123?   → pile 5  (NTP, clock synchronization)
-Did it come from 10.0.0.x?     → pile 6  (a specific internal network)
-Did it come from 192.168.0.x?  → pile 7  (another internal network)
-TCP port under 1024 (other)?   → pile 8  (other important stuff)
-Everything else                → pile 9  (default, nobody special)
+ICMP?                              → PQ 0  (ping si altele d-astea)
+Payload incepe cu GET/POST/HTTP/?  → PQ 1  (HTTP)
+Payload incepe cu 0x16 0x03 ...?   → PQ 2  (TLS/HTTPS)
+Payload incepe cu "SSH-"?          → PQ 3  (SSH)
+UDP + DNS header (opcode=0)?       → PQ 4  (DNS queries)
+UDP + NTP header (48 bytes, VN=3/4)? → PQ 5 (NTP)
+IP sursa din 10.0.0.0/24?          → PQ 6
+IP sursa din 192.168.0.0/24?       → PQ 7
+Pachet mic (sub 128 bytes IP total)? → PQ 8
+Orice altceva                      → PQ 9  (default)
 ```
-
-Here is the actual C code that does the peeking:
-
-```c
-struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-```
-`rte_pktmbuf_mtod` means "give me a pointer to the raw bytes of this packet,
-but treat them as this struct type". So now `eth` points to the ethernet header.
-
-Then we check if it is IPv4:
-```c
-if (rte_be_to_cpu_16(eth->ether_type) != RTE_ETHER_TYPE_IPV4)
-    return 9; // not IPv4, default pile
-```
-`rte_be_to_cpu_16` flips the bytes from network order to the CPU's order.
-Networks store numbers with the big byte first. Your CPU stores them the opposite way.
-This function fixes that so the number makes sense.
-
-Then we look inside the IP header:
-```c
-struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
-uint8_t proto  = ip->next_proto_id; // is it TCP, UDP, ICMP?
-uint32_t src_ip = rte_be_to_cpu_32(ip->src_addr); // who sent it?
-```
-
-`eth + 1` means "skip past the ethernet header, now point to the IP header".
-In C, pointer arithmetic on a struct pointer moves by the size of the struct.
-So `eth + 1` moves forward by exactly `sizeof(struct rte_ether_hdr)` bytes.
 
 ---
 
-## Part 3 — The Rules for Each Pile
+## Pasul 3 — Regulile pentru fiecare gramada
 
-Each pile has three configurable rules:
+Each pile has 3 configurable rules:
 
-| Rule | What it does |
-|------|-------------|
-| `drop_n` | Throw away N packets out of every 10 |
-| `dup_n`  | Make a copy of N packets out of every 10, send both |
-| `delay_us` | Hold packets for this many microseconds before sending |
+| Regula | Ce face |
+|--------|---------|
+| `drop_n` | Arunca N pachete din fiecare 10 |
+| `dup_n` | Dubleaza N pachete din fiecare 10 (trimite si copie) |
+| `delay_us` | Tine pachetele N microsecunde inainte sa le trimiti |
 
-These are all stored in `pq_configs`, a hardcoded array:
-
-```c
-static const struct pq_config pq_configs[NUM_PQ] = {
-    [0] = { "ICMP",  drop_n=2, dup_n=0, delay_us=0    },
-    [2] = { "HTTPS", drop_n=0, dup_n=0, delay_us=1000 },
-    ...
-};
-```
-
-The function `forward_mbuf()` applies these rules to one packet.
-
-### Drop logic
+### Drop
 
 ```c
-uint64_t count = pqs->pkt_count++;  // how many packets have we seen in this pile?
+uint64_t count = pqs->pkt_count++;
 
-if (cfg->drop_n > 0 && (count % 10) < cfg->drop_n) {
-    rte_pktmbuf_free(m);  // throw the envelope in the trash
+if (SHOULD_DROP(count, cfg->drop_n)) {
+    rte_pktmbuf_free(m);  // inapoi in pool
+    port_statistics[rx_port_id].dropped++;
     return;
 }
 ```
 
-`count % 10` gives us a number 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, ... repeating.
-If `drop_n` is 2, we drop packets 0 and 1 out of every group of 10.
-This is how we guarantee exactly N/10 drops regardless of burst size.
+`count % 10` cicleaza: 0,1,2,...,9,0,1,2,... si asa mai departe.
+Daca `drop_n = 2` atunci drop-am cand count%10 e 0 sau 1 → exact 2 din 10.
 
-### Duplicate logic
+Important: numaram across bursts, nu per burst.
+If we count only inside burst and burst have only 7 packets, positions 7-9 are never seen.
+Cu `pkt_count` persistent nu avem problema asta — vede FIECARE pachet.
+
+### Duplicate
 
 ```c
-if (cfg->dup_n > 0 && (count % 10) < cfg->dup_n) {
+if (SHOULD_DUP(count, cfg->dup_n)) {
     struct rte_mbuf *clone = rte_pktmbuf_copy(m, netem_pktmbuf_pool, 0, UINT32_MAX);
-    // send the clone
+    if (clone != NULL) {
+        // trimitem clona pe acelasi path ca originalul
+    }
 }
-// then also send the original
+// trimitem si originalul oricum
 ```
 
-`rte_pktmbuf_copy` makes a completely new independent copy of the packet,
-like a photocopier for envelopes. We then put both in the outbox.
+`rte_pktmbuf_copy` face o copie completa si independenta a pachetului.
+E ca o xerox a plicului. Ambele copii merg mai departe.
 
-### Delay logic — the Waiting Room
+### Delay — Sala de asteptare
 
-This is the trickiest part. We cannot just `sleep()` because that would freeze
-the whole thread and stop processing other packets.
+Asta e partea cea mai interesanta. Nu putem folosi `sleep()` pentru ca ar bloca
+intregul thread si n-am mai putea procesa alte pachete.
 
-Instead, we have a **waiting room** per pile: a circular array of slots.
-Each slot holds a packet and the timestamp when it is allowed to leave.
+In schimb avem un ring buffer per PQ unde pachetele stau pana le vine randul:
 
 ```c
 struct delay_entry {
-    struct rte_mbuf *m;       // the packet sitting in the waiting room
-    uint64_t release_tsc;     // the clock tick when it can leave
+    struct rte_mbuf *m;
+    uint64_t release_tsc;  // cand are voie sa iasa
 };
 ```
 
-When a packet enters the waiting room:
-```c
-pqs->delay_q[pqs->dq_tail].m           = m;
-pqs->delay_q[pqs->dq_tail].release_tsc = cur_tsc + delay_us * tsc_per_us;
-pqs->dq_tail = (pqs->dq_tail + 1) % DELAY_QUEUE_SIZE; // move tail forward, wrap around
-pqs->dq_count++;
-```
+The timer we use is the CPU's TSC register — a counter that ticks billions of times per second.
+`rte_rdtsc()` reads it in single instruction, no syscall needed.
 
-The clock we use is `rte_rdtsc()` — it reads the CPU's internal tick counter.
-It ticks billions of times per second, so we can measure microseconds easily.
-
-`tsc_per_us` is how many ticks fit in one microsecond:
 ```c
+// cate ticks de TSC intr-un microsecund
 uint64_t tsc_per_us = rte_get_tsc_hz() / 1000000;
+// pe un CPU de 3.2GHz: 3200000000 / 1000000 = 3200 ticks/us
 ```
-`rte_get_tsc_hz()` = how many ticks per second. Divide by 1,000,000 → ticks per µs.
 
-Every loop iteration we check if anyone in the waiting room can leave:
+Every main loop iteration we check if anyone in waiting room can leave:
+
 ```c
 while (pqs->dq_count > 0) {
     if (pqs->delay_q[pqs->dq_head].release_tsc > cur_tsc)
-        break; // still waiting
-    // time to go! send this packet
+        break;  // inca asteapta
     struct rte_mbuf *m = pqs->delay_q[pqs->dq_head].m;
-    pqs->dq_head = (pqs->dq_head + 1) % DELAY_QUEUE_SIZE;
+    pqs->dq_head = RING_NEXT(pqs->dq_head, DELAY_QUEUE_SIZE);
     pqs->dq_count--;
     rte_eth_tx_buffer(tx_port_id, 0, tx_buffer[tx_port_id], m);
 }
 ```
 
-We can `break` on the first packet that is still waiting because within one pile,
-packets always enter in time order and all have the same delay. So if packet #5
-is not ready, packets #6, #7, #8... definitely are not ready either.
+The `break` works because packets in same PQ have same delay and arrive in time order,
+so release_tsc values are always increasing from head to tail.
+Daca head-ul nu e gata, nimeni de dupa el nu poate fi gata.
 
 ---
 
-## Part 4 — Sending packets (`rte_eth_tx_buffer` and `rte_eth_tx_buffer_flush`)
+## Pasul 4 — Trimiterea pachetelor
 
-Sending one packet at a time is slow. So DPDK uses a **transmit buffer**: a small
-waiting area on the send side. We add packets to it with:
+Sending one packet at a time is very inefficient. DPDK uses a TX buffer — a small staging area:
 
 ```c
 rte_eth_tx_buffer(tx_port_id, 0, tx_buffer[tx_port_id], m);
 ```
 
-When the buffer fills up (32 packets), DPDK sends them all in one go automatically.
-Every 100 µs we also force-flush anything left in the buffer:
+When the buffer fills up (32 packets), DPDK sends them all at once automatically.
+Every 100 microseconds we force flush whatever still remains in buffer:
 
 ```c
 rte_eth_tx_buffer_flush(tx_port_id, 0, tx_buffer[tx_port_id]);
@@ -235,18 +192,15 @@ rte_eth_tx_buffer_flush(tx_port_id, 0, tx_buffer[tx_port_id]);
 
 ---
 
-## Part 5 — No Shared State = No Locks
+## Paralelism fara lock-uri
 
-This is the most important design choice.
+Cel mai important design decision din proiect.
 
-Thread 0 has its own `lcore_states[0]` which contains 10 `pq_state` structs.
-Thread 1 has its own `lcore_states[1]` which contains 10 `pq_state` structs.
+Thread 0 are propriul `lcore_states[0]` cu 10 `pq_state` struct-uri.
+Thread 1 are propriul `lcore_states[1]` cu 10 `pq_state` struct-uri.
 
-They never touch each other's data. There is no mutex, no atomic, no lock.
-This is safe because:
-- Thread 0 only reads/writes `lcore_states[0]`
-- Thread 1 only reads/writes `lcore_states[1]`
-- They do write to `port_statistics[]` but that is only for display, small races there are harmless
+Nu se ating niciodata pe date comune. Nu exista mutex, no atomic operations, nothing.
+E safe pentru ca fiecare thread citeste si scrie DOAR propriul state.
 
 ```
   Thread 0 (lcore 0)          Thread 1 (lcore 1)
@@ -258,56 +212,53 @@ This is safe because:
          |                           |
     reads port 0               reads port 1
     writes port 1              writes port 0
-         |                           |
-    tx_buffer[1]               tx_buffer[0]
 ```
 
-Because they write to **different** tx_buffers, even the send side has no conflict.
+Si TX buffer-ele sunt diferite — thread 0 scrie in `tx_buffer[1]`, thread 1 in `tx_buffer[0]`.
+So even on the send side there is no conflict at all.
 
 ---
 
-## The Main Loop — Everything Together
+## De ce DPDK si nu ceva normal?
 
-```c
-while (!force_quit) {
-    cur_tsc = rte_rdtsc();
+Normal, cand un pachet vine la placa de retea se intampla urmatoarele:
 
-    // 1. Release any delayed packets whose time has come
-    flush_delay_queues(ls, tx_port_id, cur_tsc);
-
-    // 2. Every 100 µs: flush TX buffer + maybe print stats
-    if (cur_tsc - prev_tsc > drain_tsc) {
-        rte_eth_tx_buffer_flush(...);
-        print_stats();
-        prev_tsc = cur_tsc;
-    }
-
-    // 3. Grab up to 32 new packets from the network
-    nb_rx = rte_eth_rx_burst(rx_port_id, 0, pkts_burst, MAX_PKT_BURST);
-
-    // 4. For each packet: classify → drop/dup/delay → send
-    for (i = 0; i < nb_rx; i++) {
-        pq_id = classify_packet(pkts_burst[i]);
-        forward_mbuf(pkts_burst[i], pq_id, ...);
-    }
-}
+```
+NIC receives packet
+    → NIC interrupts the CPU ("hey I have data!")
+    → kernel wakes up
+    → kernel copies packet from NIC memory to kernel memory
+    → kernel copies from kernel memory to your program's memory
+    → your program finally sees it
 ```
 
-Step 1 runs every single iteration so delayed packets escape as soon as their timer expires.
-Step 3-4 runs only when packets actually arrive.
+Doua copieri si o intrerupere per packet. La 10 milioane de pachete pe secunda
+asta inseamna 10 milioane de syscalls/secunda. CPU-ul nu mai are timp de nimic altceva.
+
+DPDK bypasses all of that:
+
+```
+NIC receives packet
+    → NIC writes directly into memory your program owns (DMA)
+    → your program reads it directly
+```
+
+No interrupt. No copy. No kernel. Just your code talking directly to hardware.
+Trade-off: DPDK "fura" un CPU core care ruleaza intr-o bucla infinita
+verificand constant daca a mai venit ceva — se numeste **poll mode**.
+Consuma curent mai mult dar latenta e minima si throughput-ul e maxim.
 
 ---
 
-## Glossary (simple words for scary terms)
+## Glosar rapid
 
-| Word | Simple meaning |
-|------|----------------|
-| `mbuf` | A struct that holds one packet (envelope) |
-| `mempool` | A pre-allocated box of mbufs so we never call `malloc` during processing |
-| `lcore` | A CPU thread pinned to one physical core |
-| `TSC` | The CPU's internal nanosecond clock, read with one instruction |
-| `tx_buffer` | A small staging area before actually sending packets |
-| `rte_be_to_cpu_16/32` | Flip byte order: network sends big-byte-first, x86 wants small-byte-first |
-| `port` | A network interface (a door packets come in or go out of) |
-| Profile Queue | One of our 10 sorting piles, each with its own rules |
-| Circular buffer | An array where the tail wraps back to the start when it reaches the end |
+| Termen | Ce inseamna |
+|--------|-------------|
+| `mbuf` | Un struct care tine un singur pachet |
+| `mempool` | Rezerva pre-alocata de mbuf-uri, nu mai facem malloc in timpul procesarii |
+| `lcore` | Un CPU thread fixat pe un core fizic |
+| `TSC` | Timer-ul intern al CPU-ului, citit cu o singura instructiune assembly |
+| `tx_buffer` | Zona de staging inainte de a trimite efectiv pachetele catre NIC |
+| port | O interfata de retea (o usa pe care intra sau ies pachetele) |
+| Profile Queue | Una din cele 10 gramezi, fiecare cu propriile reguli de drop/dup/delay |
+| Circular buffer | Un array in care tail-ul se intoarce la inceput cand ajunge la final |
