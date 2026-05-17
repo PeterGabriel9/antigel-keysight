@@ -41,7 +41,8 @@ RUN cd /home/student/challenge-app/netem && meson setup build
 
 RUN cd /home/student/challenge-app/netem && ninja -C build
 
-COPY input.pcap /home/student/input.pcap
+COPY --chown=student:student input.pcap /home/student/input.pcap
+RUN touch /home/student/output.pcap
 
 # Switch back to root so ttyd can execute 'login'
 USER root

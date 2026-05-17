@@ -73,7 +73,7 @@ cmd_update() {
         exit 1
     fi
     echo "==> Copying source files into container..."
-    for f in netem/main.c netem/http.c netem/http.h netem/netem.h netem/meson.build; do
+    for f in netem/main.c netem/http.c netem/http.h netem/netem.h netem/meson.build netem/run.sh; do
         docker cp "$f" "$CONTAINER":/home/student/challenge-app/"$f"
     done
     echo "==> Recompiling inside container..."
